@@ -1,0 +1,48 @@
+# /we-work-remotely/* — We Work Remotely, the remote job board (weworkremotely.com).
+# Run the service: SCRAPERS_PORT=6081 ONLY_SCRAPER=we-work-remotely python run.py
+@base = http://127.0.0.1:6081
+
+### Job search: keywords + categories (a group expands) + time window, newest first
+GET {{base}}/we-work-remotely/jobs/search?query=engineer&category=programming&posted_within=14d
+
+### Job search: country (code or name) + salary bucket + skills (names or ids) + hot jobs only
+GET {{base}}/we-work-remotely/jobs/search?country=US,Canada&salary_range=100k+&skills=Python,React&filter=hot
+
+### Job search: a whole category group, contract roles only, open to Europe, page 2
+GET {{base}}/we-work-remotely/jobs/search?category=design&job_type=contract&region=europe&page=2
+
+### Job search: any weworkremotely.com listing or search link as the query carries its own filters
+GET {{base}}/we-work-remotely/jobs/search?query=https://weworkremotely.com/remote-jobs/search?term=python%26categories%5B%5D=2%26sort=Past+Week
+
+### Newest jobs from the RSS feed (all, or one category's feed), posted since a date
+GET {{base}}/we-work-remotely/jobs/latest?category=full-stack-programming&since=2026-10-01&limit=20
+
+### One job in full by slug or by link
+GET {{base}}/we-work-remotely/jobs/details?job=expel-technical-account-manager
+GET {{base}}/we-work-remotely/jobs/details?job=https://weworkremotely.com/remote-jobs/expel-technical-account-manager
+
+### Every job of one category (the complete list, 50 a page)
+GET {{base}}/we-work-remotely/jobs/by-category?category=full-stack-programming&page=1
+
+### The site's region, job-type, keyword and trending lists
+GET {{base}}/we-work-remotely/jobs/by-region?region=europe
+GET {{base}}/we-work-remotely/jobs/by-type?job_type=contract&page=1
+GET {{base}}/we-work-remotely/jobs/by-keyword?keyword=python
+GET {{base}}/we-work-remotely/jobs/trending
+
+### A company's profile with every active job (slug or company link)
+GET {{base}}/we-work-remotely/companies/details?company=stripe
+GET {{base}}/we-work-remotely/companies/details?company=https://weworkremotely.com/company/toptal
+
+### A company's jobs, one category, paged
+GET {{base}}/we-work-remotely/companies/jobs?company=toptal&category=sales-and-marketing
+
+### The Top 100 remote companies
+GET {{base}}/we-work-remotely/companies/top?limit=20
+
+### Categories with live job counts, the skill / country lists, every filter value, a board snapshot
+GET {{base}}/we-work-remotely/categories
+GET {{base}}/we-work-remotely/skills?query=python
+GET {{base}}/we-work-remotely/countries?query=united
+GET {{base}}/we-work-remotely/filters
+GET {{base}}/we-work-remotely/statistics
