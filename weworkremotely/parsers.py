@@ -619,10 +619,12 @@ def _panel_text(node, placeholders=(), heading=None):
     if any(p in low for p in placeholders):
         return None, None
     lines = [ln.strip() for ln in plain.splitlines()]
-    lines = [ln for ln in lines if ln and ln not in ("-", "•") and ln.lower() != (heading or "").lower()]
+    lines = [ln for ln in lines if ln and ln not in ("-", "•")]
+    if lines and heading and lines[0].lower() == heading.lower():
+        lines = lines[1:]          # the panel repeats its own heading ("Benefits") as its first line
     if not lines:
         return None, None
-    return inner, plain
+    return inner, "\n".join(lines)
 
 
 def company_page(markup, slug, today=None):

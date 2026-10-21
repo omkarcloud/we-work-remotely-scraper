@@ -1,7 +1,13 @@
 """We Work Remotely transport: plain curl_cffi with browser-impersonated TLS.
-No browser, no login, no token, no proxy (validated 2026-10-19 from direct
-Indian egress: every surface below answered 200 on the first try, an
-80-request burst over 8 threads with a fresh session each time was 80/80).
+No browser, no login, no token (validated 2026-10-19: every surface below
+answered 200 on the first try, an 80-request burst over 8 threads with a
+fresh session each time was 80/80).
+
+Egress: in grow every session leaves through a sticky residential proxy exit
+(config.weworkremotely_proxy, WEWORKREMOTELY_REQUIRE_PROXY) — weworkremotely.com
+is never contacted from the server's own IP; with no proxy the call fails
+instead of going direct. A config without WEWORKREMOTELY_REQUIRE_PROXY (the
+open-source kit, run on the user's own machine) may go direct.
 
 Cloudflare fronts weworkremotely.com with a MANAGED CHALLENGE for plain
 curl's TLS fingerprint (cf-mitigated: challenge, "Just a moment…"); Chrome
@@ -33,8 +39,9 @@ Upstream surfaces (all on https://weworkremotely.com, server-rendered Rails):
              exist but half of them 500 server-side, so they are not used).
 
 Block handling is defensive (none was ever seen): a 403 / 429 / challenge
-page sends the worker's new sessions through a sticky fallback proxy exit for
-WEWORKREMOTELY_BLOCK_COOLDOWN seconds, and an HTML page still challenged
+page drops the worker's session, so the retry opens a fresh exit (and, when a
+separate fallback proxy is configured, uses it for
+WEWORKREMOTELY_BLOCK_COOLDOWN seconds); an HTML page still challenged
 after every curl retry is loaded once in a headful patchright Chrome
 (WEWORKREMOTELY_BROWSER_FALLBACK) that clicks Turnstile — the pattern
 greenhouse/fetch.py uses for company careers pages.
@@ -97,11 +104,18 @@ _fallback_lock = threading.Lock()
 
 
 def _proxy_for_new_session():
+    """The exit for a new session. Raises when the config requires a proxy
+    and none is available (never falls back to the server's own IP)."""
     forced = config.weworkremotely_proxy()
     if forced:
         return forced
     if time.time() < _fallback_until:
-        return config.weworkremotely_fallback_proxy()
+        fallback = config.weworkremotely_fallback_proxy()
+        if fallback:
+            return fallback
+    if getattr(config, "WEWORKREMOTELY_REQUIRE_PROXY", False):
+        raise WeworkremotelyUpstreamError("no We Work Remotely proxy configured "
+                                          "(weworkremotely.com is never contacted from the server's IP)")
     return None
 
 
@@ -109,8 +123,8 @@ def _session():
     sess = getattr(_local, "session", None)
     if sess is None:
         from curl_cffi import requests as curl_requests
-        sess = curl_requests.Session(impersonate=IMPERSONATE)
         proxy = _proxy_for_new_session()
+        sess = curl_requests.Session(impersonate=IMPERSONATE)
         if proxy:
             sess.proxies = {"http": proxy, "https": proxy}
         _local.session = sess
@@ -271,7 +285,7 @@ def _browser_page(url, label):
     with _browser_slots:
         try:
             with create_scope():
-                driver = PatchrightDriver(proxy_url=config.weworkremotely_fallback_proxy(), headless=False,
+                driver = PatchrightDriver(proxy_url=_proxy_for_new_session(), headless=False,
                                           geoip_timezone=True)
             driver.call(lambda page: page.goto(url, wait_until="domcontentloaded", timeout=60000))
             deadline = time.monotonic() + float(config.WEWORKREMOTELY_BROWSER_TIMEOUT)

@@ -106,8 +106,8 @@ def test_companies_details():
     body = call("/we-work-remotely/companies/details", company="stripe")
     assert body["name"] == "Stripe" and body["is_top_100"] is True and body["website_link"] and body["jobs"]
     assert body["jobs"][0]["company"]["slug"] == "stripe" and body["categories_hiring"]
-    by_link = call("/we-work-remotely/companies/details", company="https://weworkremotely.com/company/toptal")
-    assert by_link["name"] == "Toptal" and by_link["about_text"]
+    by_link = call("/we-work-remotely/companies/details", company="https://weworkremotely.com/company/vercel")
+    assert by_link["name"] == "Vercel" and by_link["about_text"] and by_link["website_link"] == "https://vercel.com"
     call("/we-work-remotely/companies/details", status=404, company="no-such-company-xyz-123")
 
 

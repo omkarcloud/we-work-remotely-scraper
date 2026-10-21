@@ -123,7 +123,9 @@ def _passes(job, kw):
         loc = job.get("location") or {}
         codes = {c.get("code") for c in loc.get("countries", [])}
         wanted_code = REGION_COUNTRY.get(kw["region"])
-        if kw["region"] not in loc.get("regions", []) and not (wanted_code and wanted_code in codes):
+        on_region_page = job.get("slug") in (kw.get("_region_slugs") or ())
+        if not on_region_page and kw["region"] not in loc.get("regions", []) \
+                and not (wanted_code and wanted_code in codes):
             return False
     days = refs.POSTED_WITHIN_DAYS.get(kw.get("posted_within"))
     if days is not None and ((job.get("posted_days_ago") is None) or job["posted_days_ago"] > days):
@@ -140,6 +142,36 @@ def _passes(job, kw):
             if not (cat.get("slug") == "design" and wanted & {"product-design", "ux-ui-design"}):
                 return False
     return True
+
+
+def region_slugs(region):
+    """Every job slug on the site's own region page (all of its pages),
+    memoised 10 min. A region-restricted job shows COUNTRY chips on its card
+    (🇩🇪 Germany, 🇫🇷 France …), not the region, so the region page is the
+    only reliable membership list."""
+    path = refs.REGIONS[region][0]
+
+    def page_jobs(n):
+        body, _ = get_page(path, {"page": n} if n > 1 else None, label=f"region {region} page {n}")
+        return P.listing_page(body)
+
+    def load():
+        first = page_jobs(1)
+        slugs = {j["slug"] for j in first["jobs"]}
+        last = first["page_count"] or 1
+        if last > 1:
+            for listing in run_parallel([lambda n=n: page_jobs(n) for n in range(2, last + 1)]):
+                slugs |= {j["slug"] for j in listing["jobs"]}
+                last_full = len(listing["jobs"]) >= PAGE_SIZE
+            n = last + 1
+            while last_full and n <= 100:            # the pager shows a window; walk past it while pages stay full
+                listing = page_jobs(n)
+                slugs |= {j["slug"] for j in listing["jobs"]}
+                last_full = len(listing["jobs"]) >= PAGE_SIZE
+                n += 1
+        return frozenset(slugs)
+
+    return memoized(f"weworkremotely:region:{region}", load, ttl=600)
 
 
 def _merge_link(link, kw):
@@ -171,6 +203,8 @@ def search(query=None, category=None, country=None, salary_range=None, skills=No
         kw.pop("page", None)
     page = int(page or 1)
     kw["skill_ids"] = resolve_skill_ids(kw.get("skills"))
+    if kw.get("region"):
+        kw["_region_slugs"] = region_slugs(kw["region"])
 
     body, _ = get_page("/remote-jobs/search", upstream_params(kw), label="jobs search")
     result = P.search_page(body)
@@ -198,6 +232,7 @@ def search(query=None, category=None, country=None, salary_range=None, skills=No
     total = len(jobs)
     is_truncated = bool(result["is_truncated"] and not recovered)
     kw.pop("skill_ids", None)
+    kw.pop("_region_slugs", None)
     applied = _applied(kw)
     if kw.get("skills") and not jobs:
         applied["note"] = SKILLS_NOTE
