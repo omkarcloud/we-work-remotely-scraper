@@ -39,12 +39,8 @@ Upstream surfaces (all on https://weworkremotely.com, server-rendered Rails):
              exist but half of them 500 server-side, so they are not used).
 
 Block handling is defensive (none was ever seen): a 403 / 429 / challenge
-page drops the worker's session, so the retry opens a fresh exit (and, when a
-separate fallback proxy is configured, uses it for
-WEWORKREMOTELY_BLOCK_COOLDOWN seconds); an HTML page still challenged
-after every curl retry is loaded once in a headful patchright Chrome
-(WEWORKREMOTELY_BROWSER_FALLBACK) that clicks Turnstile — the pattern
-greenhouse/fetch.py uses for company careers pages.
+page drops the worker's session, so the retry opens a fresh exit; a page
+still blocked after every retry raises WeworkremotelyBlocked.
 
 Failure taxonomy (scraper_errors, mapped to HTTP by route_glue):
   WeworkremotelyUpstreamError  transport failure / 5xx            — retryable
@@ -62,8 +58,10 @@ from urllib.parse import urlencode, urlparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
-from weworkremotely.shared import click_turnstile, is_challenged
+import egress
+from weworkremotely.shared import is_challenged
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
+from scraper_utils import debug, fanout, retry, sessions
 
 SITE = "https://weworkremotely.com"
 IMPERSONATE = "chrome"
@@ -72,12 +70,12 @@ FANOUT_WORKERS = 8
 
 PAGE_HEADERS = {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.accept_language(),
     "upgrade-insecure-requests": "1",
 }
 FEED_HEADERS = {
     "accept": "application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.accept_language(),
 }
 
 
@@ -99,8 +97,6 @@ class WeworkremotelyNotFound(NotFound):
 
 # ---- sessions ------------------------------------------------------------------
 _local = threading.local()
-_fallback_until = 0.0
-_fallback_lock = threading.Lock()
 
 
 def _proxy_for_new_session():
@@ -109,10 +105,6 @@ def _proxy_for_new_session():
     forced = config.weworkremotely_proxy()
     if forced:
         return forced
-    if time.time() < _fallback_until:
-        fallback = config.weworkremotely_fallback_proxy()
-        if fallback:
-            return fallback
     if getattr(config, "WEWORKREMOTELY_REQUIRE_PROXY", False):
         raise WeworkremotelyUpstreamError("no We Work Remotely proxy configured "
                                           "(weworkremotely.com is never contacted from the server's IP)")
@@ -132,46 +124,17 @@ def _session():
 
 
 def _drop_session():
-    sess = getattr(_local, "session", None)
-    _local.session = None
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
-
-
-def _note_block():
-    global _fallback_until
-    if config.weworkremotely_fallback_proxy() is not None:
-        with _fallback_lock:
-            _fallback_until = time.time() + config.WEWORKREMOTELY_BLOCK_COOLDOWN
+    sessions.drop(_local)
 
 
 def dump_debug(name, text):
-    dbg = os.environ.get("WEWORKREMOTELY_DEBUG_DIR", "")
-    if dbg and text:
-        try:
-            os.makedirs(dbg, exist_ok=True)
-            with open(os.path.join(dbg, name + ".txt"), "w", encoding="utf-8") as f:
-                f.write(text)
-        except OSError:
-            pass
+    debug.dump("WEWORKREMOTELY_DEBUG_DIR", name, text, encoding="utf-8")
 
 
 # ---- requests --------------------------------------------------------------------
 
 def _retrying(fn):
-    last = None
-    for attempt in range(1, config.MAX_RETRIES + 1):
-        try:
-            return fn()
-        except WeworkremotelyUpstreamError as e:          # includes Blocked
-            last = e
-            _drop_session()
-        if attempt < config.MAX_RETRIES:
-            time.sleep(config.RETRY_BACKOFF * attempt)
-    raise last
+    return retry.run(fn, config, WeworkremotelyUpstreamError, lambda e: _drop_session())
 
 
 def build_url(path, params=None):
@@ -210,7 +173,6 @@ def _get(url, headers, label):
     resp_headers = {k.lower(): v for k, v in dict(resp.headers).items()}
     if status in (403, 429) or is_challenged(status, resp_headers, body):
         dump_debug("blocked", body)
-        _note_block()
         raise WeworkremotelyBlocked(f"HTTP {status} on {label}")
     if status in (404, 410):
         return status, body, str(resp.url)
@@ -224,9 +186,8 @@ def _get(url, headers, label):
 def get_page(path, params=None, *, label=None, must_exist=True):
     """GET one HTML page -> (body, final_url). A 404 or a redirect to the
     homepage (the site's way of saying "no such job / company") raises
-    WeworkremotelyNotFound when must_exist. A Cloudflare challenge that
-    survives every curl retry is loaded once in a headful browser when
-    WEWORKREMOTELY_BROWSER_FALLBACK."""
+    WeworkremotelyNotFound when must_exist. A block that survives every curl
+    retry raises WeworkremotelyBlocked."""
     url = build_url(path, params)
     label = label or path
 
@@ -242,13 +203,7 @@ def get_page(path, params=None, *, label=None, must_exist=True):
             raise WeworkremotelyUpstreamError(f"{label} answered XML instead of HTML")
         return body, final
 
-    try:
-        return _retrying(once)
-    except WeworkremotelyBlocked:
-        if not config.WEWORKREMOTELY_BROWSER_FALLBACK:
-            raise
-        print(f"weworkremotely: {label} is blocked for curl; trying a headful browser")
-        return _browser_page(url, label), url
+    return _retrying(once)
 
 
 def get_feed(path, *, label=None):
@@ -268,83 +223,18 @@ def get_feed(path, *, label=None):
     return _retrying(once)
 
 
-# ---- headful browser fallback --------------------------------------------------------
-_browser_slots = threading.BoundedSemaphore(2)
-
-
-def _browser_page(url, label):
-    """One headful patchright Chrome: load the page, click Turnstile when
-    shown, return the rendered HTML once the challenge is gone."""
-    try:
-        from chrome_manager import create_scope
-        from patchright_driver import PatchrightDriver
-    except ImportError:
-        raise WeworkremotelyBlocked(f"Cloudflare challenge on {label} (no browser available for the fallback)")
-
-    driver = None
-    with _browser_slots:
-        try:
-            with create_scope():
-                driver = PatchrightDriver(proxy_url=_proxy_for_new_session(), headless=False,
-                                          geoip_timezone=True)
-            driver.call(lambda page: page.goto(url, wait_until="domcontentloaded", timeout=60000))
-            deadline = time.monotonic() + float(config.WEWORKREMOTELY_BROWSER_TIMEOUT)
-            last_click = 0.0
-            while time.monotonic() < deadline:
-                try:
-                    html = driver.content() or ""
-                except Exception:
-                    html = ""
-                if html and not is_challenged(403, {}, html):
-                    return html
-                if time.monotonic() - last_click > 6:
-                    try:
-                        if driver.call(click_turnstile):
-                            last_click = time.monotonic()
-                    except Exception:
-                        pass
-                time.sleep(1.0)
-            raise WeworkremotelyBlocked(f"Cloudflare challenge did not clear in a browser on {label}")
-        finally:
-            if driver is not None:
-                try:
-                    driver.close()
-                except Exception:
-                    pass
-
-
 # ---- fan-out ------------------------------------------------------------------------
 _pool = ThreadPoolExecutor(max_workers=FANOUT_WORKERS, thread_name_prefix="weworkremotely")
 
 
 def run_parallel(fns):
-    if not fns:
-        return []
-    if len(fns) == 1:
-        return [fns[0]()]
-    futures = [_pool.submit(fn) for fn in fns]
-    return [f.result() for f in futures]
+    return fanout.on_pool(_pool, fns)
 
 
 def gather(mapping, optional=()):
     """{key: callable} in parallel -> {key: result}. Keys named in `optional`
     yield None instead of failing the set when they raise a scraper error."""
-    keys = list(mapping)
-
-    def guarded(key):
-        fn = mapping[key]
-        if key not in optional:
-            return fn
-
-        def run():
-            try:
-                return fn()
-            except (UpstreamError, BadRequest, NotFound):
-                return None
-        return run
-
-    results = run_parallel([guarded(k) for k in keys])
-    return dict(zip(keys, results))
+    return fanout.gather_optional(run_parallel, mapping, optional, (UpstreamError, BadRequest, NotFound))
 
 
 if __name__ == "__main__":
